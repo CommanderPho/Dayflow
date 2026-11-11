@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Foundation
 import SwiftUI
 
@@ -6,7 +7,7 @@ import SwiftUI
 
 private let cachedTimeFormatter: DateFormatter = {
   let formatter = DateFormatter()
-  formatter.timeStyle = .short
+  formatter.dateFormat = "HH:mm"
   return formatter
 }()
 
@@ -34,6 +35,10 @@ private struct CanvasPositionedActivity: Identifiable {
   let faviconSecondaryHost: String?
   let failureCount: Int
   let batchIds: [Int64]
+  /// A card from another of the user's devices.
+  var isRemote: Bool = false
+  /// Split the card only when local and remote activity overlap in time.
+  var needsSeparateLane: Bool = false
 }
 
 struct CanvasTimelineDataView: View {
@@ -64,6 +69,8 @@ struct CanvasTimelineDataView: View {
   @Environment(\.dayflowTheme) private var theme
   @State private var selectedCardId: String? = nil
   @State private var positionedActivities: [CanvasPositionedActivity] = []
+  /// Width of the cards layer (for the Dayflow Sync remote-device lane).
+  @State private var cardsLayerWidth: CGFloat = 0
   @State private var recordingProjection: TimelineRecordingProjectionWindow?
   @State private var scrollGeometry = TimelineScrollGeometry()
   @State private var refreshTimer: Timer?
@@ -136,6 +143,7 @@ struct CanvasTimelineDataView: View {
       .onChange(of: refreshTrigger) { loadActivities() }
       .onChange(of: appState.isRecording) { loadActivities(animate: false) }
       .onChange(of: hourHeight) { loadActivities(animate: false) }
+      .onReceive(syncCardsRevision) { _ in loadActivities(animate: false, deferWhileHovering: true) }
       .onReceive(
         NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
       ) { _ in
@@ -321,6 +329,16 @@ struct CanvasTimelineDataView: View {
   // No GeometryReader here on purpose: inside a ScrollView its closure re-runs
   // as the content moves, which rebuilt every card on every scroll frame.
   // Cards fill the layer's width and are offset to their start time instead.
+  private func laneMaxWidth(_ item: CanvasPositionedActivity) -> CGFloat {
+    guard item.needsSeparateLane, cardsLayerWidth > 0 else { return .infinity }
+    return max(0, cardsLayerWidth / 2 - 2)
+  }
+
+  private func laneOffsetX(_ item: CanvasPositionedActivity) -> CGFloat {
+    guard item.needsSeparateLane, cardsLayerWidth > 0, item.isRemote else { return 0 }
+    return cardsLayerWidth / 2 + 2
+  }
+
   private var cardsLayer: some View {
     ZStack(alignment: .topLeading) {
       Color.clear
@@ -367,9 +385,11 @@ struct CanvasTimelineDataView: View {
           hoverScale: cardHoverScale,
           pressedScale: cardPressedScale
         )
-        .frame(maxWidth: .infinity)
+        .frame(maxWidth: laneMaxWidth(item))
         .frame(height: item.height)
-        .offset(y: item.yPosition)
+        // Dayflow Sync: project chips, private mark, "from <device>", project filter dimming.
+        .modifier(CanvasCardSyncDecoration(recordId: item.activity.recordId, height: item.height))
+        .offset(x: laneOffsetX(item), y: item.yPosition)
         .opacity(mutedCategoryKeys.contains(categoryFilterKey(item.categoryName)) ? 0.25 : 1)
         .animation(.easeOut(duration: 0.15), value: mutedCategoryKeys)
         // Staggered entrance animation (Emil Kowalski: sequential reveal creates polish)
@@ -390,6 +410,11 @@ struct CanvasTimelineDataView: View {
     // behavior or the weekly-hours-footer overlap logic — those are the
     // paths most likely to have depended on the old clipping.
     .frame(minWidth: 0, maxWidth: .infinity)
+    .onGeometryChange(for: CGFloat.self) { proxy in
+      proxy.size.width
+    } action: { width in
+      cardsLayerWidth = width
+    }
     .onHover { hovering in
       cardsHover.isHovering = hovering
       guard !hovering, cardsHover.pendingRefresh else { return }
@@ -639,10 +664,32 @@ struct CanvasTimelineDataView: View {
       // Mitigation transform: resolve visual overlaps by trimming larger cards
       // so that smaller cards "win". This is a display-only fix to handle
       // upstream card-generation overlap bugs without touching stored data.
-      let segments = TimelineActivityLoader.resolveDisplaySegments(from: payload.activities)
+      // Local and remote cards are trimmed within their own source. Only cards that actually
+      // overlap across sources need separate lanes.
+      let remoteIds = MacSyncLookup.remoteCardIds(payload.activities.compactMap { $0.recordId })
+      let localActivities = payload.activities.filter { a in a.recordId.map { !remoteIds.contains($0) } ?? true }
+      let remoteActivities = payload.activities.filter { a in a.recordId.map { remoteIds.contains($0) } ?? false }
+      let localSegments = TimelineActivityLoader.resolveDisplaySegments(from: localActivities)
+      let remoteSegments =
+        remoteActivities.isEmpty ? [] : TimelineActivityLoader.resolveDisplaySegments(from: remoteActivities)
+      let segments = localSegments + remoteSegments
+      var splitSegmentIDs = Set<String>()
+      for i in segments.indices {
+        let first = segments[i]
+        let firstRemote = first.activity.recordId.map { remoteIds.contains($0) } ?? false
+        for j in segments.indices where j > i {
+          let second = segments[j]
+          let secondRemote = second.activity.recordId.map { remoteIds.contains($0) } ?? false
+          guard firstRemote != secondRemote,
+            first.start < second.end, second.start < first.end
+          else { continue }
+          splitSegmentIDs.insert(first.activity.id)
+          splitSegmentIDs.insert(second.activity.id)
+        }
+      }
       let recordingProjection = TimelineActivityLoader.recordingProjectionWindow(
         for: payload.timelineDate,
-        displaySegments: segments,
+        displaySegments: localSegments,
         now: Date()
       )
 
@@ -672,7 +719,9 @@ struct CanvasTimelineDataView: View {
           faviconPrimaryHost: primaryHost,
           faviconSecondaryHost: secondaryHost,
           failureCount: seg.failureCount,
-          batchIds: seg.batchIds
+          batchIds: seg.batchIds,
+          isRemote: seg.activity.recordId.map { remoteIds.contains($0) } ?? false,
+          needsSeparateLane: splitSegmentIDs.contains(seg.activity.id)
         )
       }
 
@@ -702,6 +751,7 @@ struct CanvasTimelineDataView: View {
           self.cardEntranceProgress = [:]
         }
         self.positionedActivities = positioned
+        CardSyncInfoStore.shared.refresh(recordIds: positioned.compactMap { $0.activity.recordId })
         self.recordingProjection = recordingProjection
         self.hasAnyActivities = !positioned.isEmpty
         if let selectedActivity,
@@ -756,10 +806,11 @@ struct CanvasTimelineDataView: View {
     }
 
     var cardFrames = positionedActivities.map { item in
-      CGRect(
-        x: cardsMinX,
+      let splitWidth = max(0, cardsWidth / 2 - 2)
+      return CGRect(
+        x: cardsMinX + (item.needsSeparateLane && item.isRemote ? cardsWidth / 2 + 2 : 0),
         y: contentFrame.minY + item.yPosition,
-        width: cardsWidth,
+        width: item.needsSeparateLane ? splitWidth : cardsWidth,
         height: item.height
       )
     }
@@ -830,7 +881,21 @@ struct CanvasTimelineDataView: View {
     return "\(s) - \(e)"
   }
 
+  /// Dayflow Sync changed cards (pulled from other devices, project chips, private marks).
+  private var syncCardsRevision: AnyPublisher<Int, Never> {
+    SyncCenter.shared.$cardsRevision.dropFirst().eraseToAnyPublisher()
+  }
+
   private func style(for rawCategory: String) -> CanvasActivityCardStyle {
+    if let fixedHex = syncFixedCategoryColorHex(rawCategory) {
+      // "Out of scope" blocks from other devices have no CategoryStore entry.
+      return CanvasActivityCardStyle(
+        text: theme.cardTitle,
+        time: theme.cardTime,
+        accent: Color(nsColor: NSColor(hex: fixedHex) ?? .systemGray),
+        isIdle: false
+      )
+    }
     let normalized = rawCategory.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     let categories = categoryStore.categories
     let matched = categories.first {

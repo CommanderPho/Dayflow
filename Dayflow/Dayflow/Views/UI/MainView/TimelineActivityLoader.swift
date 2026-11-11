@@ -54,7 +54,8 @@ enum TimelineActivityLoader {
   ) -> (dayString: String, timelineDate: Date, activities: [TimelineActivity]) {
     let timelineDate = timelineDisplayDate(from: selectedDate, now: now)
     let dayString = DateFormatter.yyyyMMdd.string(from: timelineDate)
-    let cards = storageManager.fetchTimelineCards(forDay: dayString)
+    let cards = (storageManager as? StorageManager)?.fetchTimelineCards(forDay: dayString, localOnly: true)
+      ?? storageManager.fetchTimelineCards(forDay: dayString)
     let visibleCards = displayableCards(cards, storageManager: storageManager)
     return (dayString, timelineDate, buildActivities(from: visibleCards))
   }
@@ -63,8 +64,9 @@ enum TimelineActivityLoader {
     in weekRange: TimelineWeekRange,
     storageManager: StorageManaging = StorageManager.shared
   ) -> [TimelineActivity] {
-    let cards = storageManager.fetchTimelineCardsByTimeRange(
-      from: weekRange.weekStart, to: weekRange.weekEnd)
+    let cards = (storageManager as? StorageManager)?.fetchTimelineCardsByTimeRange(
+      from: weekRange.weekStart, to: weekRange.weekEnd, localOnly: true)
+      ?? storageManager.fetchTimelineCardsByTimeRange(from: weekRange.weekStart, to: weekRange.weekEnd)
     return buildActivities(from: displayableCards(cards, storageManager: storageManager))
   }
 
@@ -99,49 +101,39 @@ enum TimelineActivityLoader {
     results.reserveCapacity(cards.count)
 
     for card in cards {
-      guard
-        let baseDay = DateFormatter.yyyyMMdd.date(from: card.day),
-        let parsedStart = timeFormatter.date(from: card.startTimestamp),
-        let parsedEnd = timeFormatter.date(from: card.endTimestamp)
-      else {
-        continue
-      }
-
-      let baseDate = calendar.startOfDay(for: baseDay)
-      let startComponents = calendar.dateComponents([.hour, .minute], from: parsedStart)
-      let endComponents = calendar.dateComponents([.hour, .minute], from: parsedEnd)
-
-      guard
-        let startDate = calendar.date(
-          bySettingHour: startComponents.hour ?? 0,
-          minute: startComponents.minute ?? 0,
-          second: 0,
-          of: baseDate
-        ),
-        let endDate = calendar.date(
-          bySettingHour: endComponents.hour ?? 0,
-          minute: endComponents.minute ?? 0,
-          second: 0,
-          of: baseDate
-        )
-      else {
-        continue
-      }
-
-      var adjustedStartDate = startDate
-      var adjustedEndDate = endDate
-
-      if calendar.component(.hour, from: startDate) < 4 {
-        adjustedStartDate = calendar.date(byAdding: .day, value: 1, to: startDate) ?? startDate
-      }
-
-      if calendar.component(.hour, from: endDate) < 4 {
-        adjustedEndDate = calendar.date(byAdding: .day, value: 1, to: endDate) ?? endDate
-      }
-
-      if adjustedEndDate < adjustedStartDate {
-        adjustedEndDate =
-          calendar.date(byAdding: .day, value: 1, to: adjustedEndDate) ?? adjustedEndDate
+      let adjustedStartDate: Date
+      let adjustedEndDate: Date
+      if let start = card.startTs, let end = card.endTs, start > 0, end >= start {
+        // The source device's `day` and clock strings are in its own time zone. Epoch seconds
+        // align every device lane to the time zone of the Mac viewing the timeline.
+        adjustedStartDate = Date(timeIntervalSince1970: TimeInterval(start))
+        adjustedEndDate = Date(timeIntervalSince1970: TimeInterval(end))
+      } else {
+        guard
+          let baseDay = DateFormatter.yyyyMMdd.date(from: card.day),
+          let parsedStart = timeFormatter.date(from: card.startTimestamp),
+          let parsedEnd = timeFormatter.date(from: card.endTimestamp)
+        else { continue }
+        let baseDate = calendar.startOfDay(for: baseDay)
+        let startComponents = calendar.dateComponents([.hour, .minute], from: parsedStart)
+        let endComponents = calendar.dateComponents([.hour, .minute], from: parsedEnd)
+        guard
+          let startDate = calendar.date(bySettingHour: startComponents.hour ?? 0,
+                                        minute: startComponents.minute ?? 0, second: 0, of: baseDate),
+          let endDate = calendar.date(bySettingHour: endComponents.hour ?? 0,
+                                      minute: endComponents.minute ?? 0, second: 0, of: baseDate)
+        else { continue }
+        var start = startDate
+        var end = endDate
+        if calendar.component(.hour, from: startDate) < 4 {
+          start = calendar.date(byAdding: .day, value: 1, to: startDate) ?? startDate
+        }
+        if calendar.component(.hour, from: endDate) < 4 {
+          end = calendar.date(byAdding: .day, value: 1, to: endDate) ?? endDate
+        }
+        if end < start { end = calendar.date(byAdding: .day, value: 1, to: end) ?? end }
+        adjustedStartDate = start
+        adjustedEndDate = end
       }
 
       let baseId = TimelineActivity.stableId(

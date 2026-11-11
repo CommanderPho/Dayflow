@@ -23,6 +23,7 @@ enum SidebarIcon: CaseIterable {
   case chat
   case flow
   case agents
+  case team
   case bug
   case settings
 
@@ -34,6 +35,7 @@ enum SidebarIcon: CaseIterable {
     case .chat: return "ChatIcon"
     case .flow: return "FlowIcon"
     case .agents: return "AgentsIcon"
+    case .team: return nil
     case .bug: return nil
     case .settings: return nil
     }
@@ -43,6 +45,7 @@ enum SidebarIcon: CaseIterable {
     switch self {
     case .flow: return "water.waves"
     case .agents: return "sparkles"
+    case .team: return "person.2.fill"
     case .bug: return "exclamationmark.bubble.fill"
     case .settings: return "gearshape.fill"
     default: return nil
@@ -63,6 +66,7 @@ enum SidebarIcon: CaseIterable {
     case .chat: return String(localized: "Chat")
     case .flow: return String(localized: "Flow")
     case .agents: return String(localized: "Agents")
+    case .team: return String(localized: "Team")
     case .bug: return String(localized: "Support")
     case .settings: return String(localized: "Settings")
     }
@@ -76,6 +80,7 @@ enum SidebarIcon: CaseIterable {
     case .chat: return "dashboard"
     case .flow: return "flow"
     case .agents: return "agents"
+    case .team: return "team"
     case .bug: return "bug_report"
     case .settings: return "settings"
     }
@@ -85,6 +90,8 @@ enum SidebarIcon: CaseIterable {
 struct SidebarView: View {
   @Binding var selectedIcon: SidebarIcon
   @ObservedObject private var badgeManager = NotificationBadgeManager.shared
+  @Environment(\.dayflowTheme) private var theme
+  @State private var dashboardError: String?
 
   var body: some View {
     VStack(alignment: .center, spacing: SidebarMetrics.itemSpacing) {
@@ -97,6 +104,30 @@ struct SidebarView: View {
         )
         .frame(width: SidebarMetrics.itemSize, height: SidebarMetrics.itemSize)
       }
+      Button {
+        Task { @MainActor in
+          do { try await SyncCenter.shared.openDashboard() }
+          catch { dashboardError = error.localizedDescription }
+        }
+      } label: {
+        VStack(spacing: SidebarMetrics.iconLabelSpacing) {
+          Image(systemName: "arrow.up.right.square")
+            .font(.system(size: SidebarMetrics.fallbackSymbolSize))
+            .foregroundColor(theme.sidebarIcon)
+            .frame(width: SidebarMetrics.iconContainerSize, height: SidebarMetrics.iconContainerSize)
+          Text("Dashboard")
+            .font(.custom("Figtree", size: SidebarMetrics.labelFontSize))
+            .foregroundColor(theme.sidebarLabel)
+        }
+        .frame(width: SidebarMetrics.itemSize, height: SidebarMetrics.itemSize)
+      }
+      .buttonStyle(DayflowPressScaleButtonStyle())
+      .help(String(localized: "Open web dashboard"))
+      .alert("Could not open Dashboard", isPresented: Binding(
+        get: { dashboardError != nil }, set: { if !$0 { dashboardError = nil } }
+      )) {
+        Button("OK", role: .cancel) { dashboardError = nil }
+      } message: { Text(dashboardError ?? "") }
     }
   }
 

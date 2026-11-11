@@ -472,6 +472,8 @@ func normalizedHex(_ value: String) -> String {
 }
 
 func fallbackColorHex(for key: String) -> String {
+  // "Out of scope" blocks from Dayflow Sync are always neutral grey.
+  if let fixed = syncFixedCategoryColorHex(key) { return fixed }
   let hash = key.utf8.reduce(5381) { current, byte in
     ((current << 5) &+ current) &+ Int(byte)
   }
@@ -482,9 +484,7 @@ func fallbackColorHex(for key: String) -> String {
 
 func formatAxisHourLabel(fromAbsoluteHour hour: Int) -> String {
   let normalized = ((hour % 24) + 24) % 24
-  let date =
-    Calendar.current.date(bySettingHour: normalized, minute: 0, second: 0, of: Date()) ?? Date()
-  return date.formatted(.dateTime.hour())
+  return String(format: "%02d:00", normalized)
 }
 
 func formatCount(_ count: Int) -> String {
